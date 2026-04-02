@@ -1,0 +1,95 @@
+name: "Wally Backend: CI/CD"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wally-registry-backend/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backend-ci-cd.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Build and push backend image to Artifact Registry"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: studs-gg-production
+  REGION: us-central1
+  REPOSITORY: services
+  IMAGE: wally-backend
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: wally-registry-backend/Dockerfile
+          cache-from: type=gha,scope=wally-backend
+          cache-to: type=gha,scope=wally-backend,mode=max
+
+  publish:
+    name: Publish
+    needs: build
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_ARTIFACT_SA_KEY }}
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate tag
+        id: tag
+        run: |
+          HASH=$(git rev-parse --short=7 HEAD)
+          echo "value=ci-$(date -u +%Y-%m-%d-%H-%M)-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: wally-registry-backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
+            ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:latest
+          cache-from: |
+            type=gha,scope=wally-backend
+            type=registry,ref=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:cache
+          cache-to: type=registry,ref=${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:cache,mode=max
